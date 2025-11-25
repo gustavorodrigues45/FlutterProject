@@ -1,4 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'database/database_helper.dart';
+import 'services/auth_service.dart';
+import 'services/image_service.dart';
+import 'services/notification_service.dart';
+import 'services/sync_service.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 // ========================= DADOS GLOBAIS (SIMULAÇÃO DE BANCO DE DADOS) =========================
 // Lista global para armazenar os gados cadastrados dinamicamente.
@@ -15,8 +22,33 @@ const List<String> listaOpcoesVacinas = [
   'IBR/BVD',
 ];
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Nota: MySQL removido - app usa lista em memória para demo
+  // Para produção, implemente API REST ou use MySQL em desktop/mobile
+  
+  // Em Web, evitamos inicializações que não são suportadas
+  if (!kIsWeb) {
+    // Inicializar serviço de notificações (somente mobile/desktop)
+    await NotificationService().initialize();
+    await NotificationService().solicitarPermissoes();
+
+    // Inicializar serviço de sincronização
+    await SyncService().inicializar();
+
+    // Solicitar permissões
+    await _solicitarPermissoes();
+  }
+  
   runApp(const GerenciamentoGadoApp());
+}
+
+Future<void> _solicitarPermissoes() async {
+  await Permission.camera.request();
+  await Permission.storage.request();
+  await Permission.photos.request();
+  await Permission.notification.request();
 }
 
 // ========================= MODELO DE DADOS (MUTÁVEL PARA EDIÇÃO) =========================
@@ -24,10 +56,11 @@ class Gado {
   // ID único do gado (gerado automaticamente se não fornecido)
   String id;
   String nome;
-  String idade;
-  String peso;
+  int idade; // Alterado para int
+  int peso;  // Alterado para int
   String vacinas; // String contendo vacinas separadas por vírgula
   String sexo;
+  int ativo; // 1 ativo, 0 inativo (venda/perda)
 
   // NOVOS CAMPOS PARA ATENDER A ESTRUTURA SOLICITADA
   // foto: caminho/URI da foto ou base64 (opcional)
@@ -45,11 +78,49 @@ class Gado {
     required this.peso,
     required this.vacinas,
     required this.sexo,
+    this.ativo = 1,
     this.foto,
     this.ownerId,
     this.propriedadeId,
     this.loteId,
   }) : id = id ?? DateTime.now().microsecondsSinceEpoch.toString();
+  
+  // Converter para Map para salvar no banco
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'nome': nome,
+      'idade': idade,
+      'peso': peso,
+      'vacinas': vacinas,
+      'sexo': sexo,
+      'ativo': ativo,
+      'foto': foto,
+      'owner_id': ownerId,
+      'propriedade_id': propriedadeId,
+      'lote_id': loteId,
+      'criado_em': DateTime.now().toIso8601String(),
+      'atualizado_em': DateTime.now().toIso8601String(),
+      'sincronizado': 0,
+    };
+  }
+  
+  // Criar Gado a partir de Map do banco
+  factory Gado.fromMap(Map<String, dynamic> map) {
+    return Gado(
+      id: map['id'],
+      nome: map['nome'],
+      idade: map['idade'],
+      peso: map['peso'],
+      vacinas: map['vacinas'],
+      sexo: map['sexo'],
+      ativo: map['ativo'] ?? 1,
+      foto: map['foto'],
+      ownerId: map['owner_id'],
+      propriedadeId: map['propriedade_id'],
+      loteId: map['lote_id'],
+    );
+  }
 }
 
 // ========================= NOVO MODELO: PROPRIETÁRIOS/POLÍCIAS/LOTES =========================
@@ -204,13 +275,35 @@ class _LoginPageState extends State<LoginPage> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
+  final AuthService _authService = AuthService();
+  bool _isLoading = false;
 
-  void _login() {
+  Future<void> _login() async {
     if (_formKey.currentState!.validate()) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (context) => const DashboardPage()),
+      setState(() => _isLoading = true);
+      
+      final resultado = await _authService.login(
+        _emailController.text.trim(),
+        _passwordController.text,
       );
+      
+      setState(() => _isLoading = false);
+      
+      if (resultado['sucesso']) {
+        if (!mounted) return;
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (context) => const DashboardPage()),
+        );
+      } else {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(resultado['mensagem']),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
@@ -224,38 +317,94 @@ class _LoginPageState extends State<LoginPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Login')),
-      body: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Form(
-          key: _formKey,
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              TextFormField(
-                controller: _emailController,
-                decoration: const InputDecoration(labelText: 'E-mail'),
-                validator: (value) =>
-                    value!.isEmpty ? 'Informe o e-mail' : null,
-              ),
-              const SizedBox(height: 10),
-              TextFormField(
-                controller: _passwordController,
-                obscureText: true,
-                decoration: const InputDecoration(labelText: 'Senha'),
-                validator: (value) =>
-                    value!.isEmpty ? 'Informe a senha' : null,
-              ),
-              const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _login,
-                child: const Text('Entrar'),
-              ),
-              TextButton(
-                onPressed: _goToRegister,
-                child: const Text('Criar conta'),
-              ),
-            ],
+      appBar: AppBar(
+        title: const Text('Login - Gerenciamento de Gado'),
+        backgroundColor: Colors.green[700],
+        foregroundColor: Colors.white,
+      ),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Logo/Ícone
+                Icon(
+                  Icons.pets,
+                  size: 100,
+                  color: Colors.green[700],
+                ),
+                const SizedBox(height: 20),
+                const Text(
+                  'Bem-vindo!',
+                  style: TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 40),
+                TextFormField(
+                  controller: _emailController,
+                  decoration: const InputDecoration(
+                    labelText: 'E-mail',
+                    border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.email),
+                  ),
+                  keyboardType: TextInputType.emailAddress,
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return 'Informe o e-mail';
+                    }
+                    if (!value.contains('@')) {
+                      return 'E-mail inválido';
+                    }
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 15),
+                TextFormField(
+                  controller: _passwordController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Senha',
+                    border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.lock),
+                  ),
+                  validator: (value) =>
+                      value!.isEmpty ? 'Informe a senha' : null,
+                ),
+                const SizedBox(height: 25),
+                SizedBox(
+                  width: double.infinity,
+                  height: 50,
+                  child: ElevatedButton(
+                    onPressed: _isLoading ? null : _login,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green[700],
+                      foregroundColor: Colors.white,
+                    ),
+                    child: _isLoading
+                        ? const CircularProgressIndicator(color: Colors.white)
+                        : const Text('Entrar', style: TextStyle(fontSize: 18)),
+                  ),
+                ),
+                const SizedBox(height: 15),
+                TextButton(
+                  onPressed: _goToRegister,
+                  child: const Text('Criar conta'),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  'Login padrão: admin@gado.com / admin123',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.grey[600],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -276,13 +425,32 @@ class _RegisterPageState extends State<RegisterPage> {
   final _nameController = TextEditingController();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
+  final AuthService _authService = AuthService();
+  bool _isLoading = false;
 
-  void _register() {
+  Future<void> _register() async {
     if (_formKey.currentState!.validate()) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Usuário cadastrado com sucesso!')),
+      setState(() => _isLoading = true);
+      
+      final resultado = await _authService.registrar(
+        _nameController.text.trim(),
+        _emailController.text.trim(),
+        _passwordController.text,
       );
-      Navigator.pop(context);
+      
+      setState(() => _isLoading = false);
+      
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(resultado['mensagem']),
+          backgroundColor: resultado['sucesso'] ? Colors.green : Colors.red,
+        ),
+      );
+      
+      if (resultado['sucesso']) {
+        Navigator.pop(context);
+      }
     }
   }
 
@@ -318,9 +486,15 @@ class _RegisterPageState extends State<RegisterPage> {
                     value!.isEmpty ? 'Informe a senha' : null,
               ),
               const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _register,
-                child: const Text('Cadastrar'),
+              SizedBox(
+                width: double.infinity,
+                height: 50,
+                child: ElevatedButton(
+                  onPressed: _isLoading ? null : _register,
+                  child: _isLoading
+                      ? const CircularProgressIndicator()
+                      : const Text('Cadastrar'),
+                ),
               ),
             ],
           ),
@@ -331,8 +505,30 @@ class _RegisterPageState extends State<RegisterPage> {
 }
 
 // ========================= DASHBOARD (PAINEL) =========================
-class DashboardPage extends StatelessWidget {
+class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
+
+  @override
+  State<DashboardPage> createState() => _DashboardPageState();
+}
+
+class _DashboardPageState extends State<DashboardPage> {
+  Map<String, int>? _metricas;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _carregarMetricas();
+  }
+
+  Future<void> _carregarMetricas() async {
+    final m = await DatabaseHelper().obterMetricasDashboard();
+    setState(() {
+      _metricas = m;
+      _loading = false;
+    });
+  }
 
   void _goToGadoList(BuildContext context) {
     Navigator.push(
@@ -352,29 +548,72 @@ class DashboardPage extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Painel de Gado')),
-      body: Center(
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: _carregarMetricas,
+              child: ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  Row(
+                    children: [
+                      Expanded(child: _cardMetric('Total', _metricas!['total'] ?? 0, Icons.all_inbox, Colors.blue)),
+                      const SizedBox(width: 8),
+                      Expanded(child: _cardMetric('Ativos', _metricas!['ativos'] ?? 0, Icons.check_circle, Colors.green)),
+                      const SizedBox(width: 8),
+                      Expanded(child: _cardMetric('Inativos', _metricas!['inativos'] ?? 0, Icons.remove_circle, Colors.grey)),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(child: _cardMetric('Vendas (30d)', _metricas!['vendas30'] ?? 0, Icons.sell, Colors.orange)),
+                      const SizedBox(width: 8),
+                      Expanded(child: _cardMetric('Perdas (30d)', _metricas!['perdas30'] ?? 0, Icons.warning, Colors.red)),
+                      const SizedBox(width: 8),
+                      Expanded(child: _cardMetric('Vacinas (7d)', _metricas!['proximasVacinas7'] ?? 0, Icons.vaccines, Colors.purple)),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  const Divider(),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: () => _goToGadoCadastro(context),
+                          icon: const Icon(Icons.add),
+                          label: const Text('Cadastrar Novo Gado'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: () => _goToGadoList(context),
+                          icon: const Icon(Icons.list),
+                          label: const Text('Ver Lista de Gados'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _cardMetric(String label, int value, IconData icon, Color color) {
+    return Card(
+      elevation: 3,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
         child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.dashboard, size: 80, color: Colors.green),
-            const SizedBox(height: 20),
-            const Text(
-              'Bem-vindo ao Painel!',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-            const Text('Selecione uma opção abaixo:'),
-            const SizedBox(height: 30),
-            ElevatedButton.icon(
-              onPressed: () => _goToGadoCadastro(context),
-              icon: const Icon(Icons.add),
-              label: const Text('Cadastrar Novo Gado'),
-            ),
-            const SizedBox(height: 10),
-            ElevatedButton.icon(
-              onPressed: () => _goToGadoList(context),
-              icon: const Icon(Icons.list),
-              label: const Text('Ver Lista de Gados'),
-            ),
+            Icon(icon, color: color),
+            const SizedBox(height: 6),
+            Text('$value', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(label, style: const TextStyle(color: Colors.grey)),
           ],
         ),
       ),
@@ -428,62 +667,77 @@ class _CadastrarGadoPageState extends State<CadastrarGadoPage> {
   // Cria um novo proprietário via diálogo simples
 
 
-  void _salvarCadastro() {
+  Future<void> _salvarCadastro() async {
     if (_formKey.currentState!.validate()) {
-      final novoGado = Gado(
-        nome: _nomeController.text,
-        idade: _idadeController.text,
-        peso: _pesoController.text,
-        // NOVO: Salva as vacinas como uma string formatada ou "N/A"
-        vacinas: _vacinasSelecionadas.isEmpty
-            ? 'N/A'
-            : _vacinasSelecionadas.join(', '), // Junta as vacinas com vírgula
-        sexo: _sexoSelecionado ?? 'Não informado',
-        foto: _fotoController.text.isEmpty ? null : _fotoController.text,
-        ownerId: _ownerId,
-        propriedadeId: _propriedadeId,
-        loteId: _loteId,
-      );
+      try {
+        final novoGado = Gado(
+          nome: _nomeController.text,
+          idade: int.tryParse(_idadeController.text) ?? 0,
+          peso: int.tryParse(_pesoController.text) ?? 0,
+          // NOVO: Salva as vacinas como uma string formatada ou "N/A"
+          vacinas: _vacinasSelecionadas.isEmpty
+              ? 'N/A'
+              : _vacinasSelecionadas.join(', '), // Junta as vacinas com vírgula
+          sexo: _sexoSelecionado ?? 'Não informado',
+          foto: _fotoController.text.isEmpty ? null : _fotoController.text,
+          ownerId: _ownerId,
+          propriedadeId: _propriedadeId,
+          loteId: _loteId,
+        );
 
-      gadosCadastrados.add(novoGado);
+        // Salvar no banco de dados
+        await DatabaseHelper().inserirGado(novoGado.toMap());
+        
+        // Manter compatibilidade com lista em memória
+        gadosCadastrados.add(novoGado);
 
-      // Se vinculou a uma propriedade, registre o id do gado na propriedade
-      if (_ownerId != null && _propriedadeId != null) {
-        final ownerIndex = proprietarios.indexWhere((p) => p.id == _ownerId);
-        if (ownerIndex != -1) {
-          final propIndex = proprietarios[ownerIndex].propriedades.indexWhere((pr) => pr.id == _propriedadeId);
-          if (propIndex != -1) {
-            proprietarios[ownerIndex].propriedades[propIndex].gadoIds.add(novoGado.id);
+        // Se vinculou a uma propriedade, registre o id do gado na propriedade
+        if (_ownerId != null && _propriedadeId != null) {
+          final ownerIndex = proprietarios.indexWhere((p) => p.id == _ownerId);
+          if (ownerIndex != -1) {
+            final propIndex = proprietarios[ownerIndex].propriedades.indexWhere((pr) => pr.id == _propriedadeId);
+            if (propIndex != -1) {
+              proprietarios[ownerIndex].propriedades[propIndex].gadoIds.add(novoGado.id);
+            }
           }
         }
+
+        // Limpa os campos para novo cadastro
+        _nomeController.clear();
+        _idadeController.clear();
+        _pesoController.clear();
+        setState(() {
+          _sexoSelecionado = null;
+          _vacinasSelecionadas = []; // Limpa a seleção
+          _fotoController.clear();
+          _ownerId = null;
+          _propriedadeId = null;
+          _loteId = null;
+        });
+
+        if (!mounted) return;
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Cadastro realizado'),
+            content: Text('${novoGado.nome} foi adicionado à lista com sucesso!'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Erro ao salvar: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
       }
-
-      // Limpa os campos para novo cadastro
-      _nomeController.clear();
-      _idadeController.clear();
-      _pesoController.clear();
-      setState(() {
-        _sexoSelecionado = null;
-        _vacinasSelecionadas = []; // Limpa a seleção
-        _fotoController.clear();
-        _ownerId = null;
-        _propriedadeId = null;
-        _loteId = null;
-      });
-
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Cadastro realizado'),
-          content: Text('${novoGado.nome} foi adicionado à lista com sucesso!'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('OK'),
-            ),
-          ],
-        ),
-      );
     }
   }
 
@@ -529,14 +783,43 @@ class _CadastrarGadoPageState extends State<CadastrarGadoPage> {
                     value!.isEmpty ? 'Informe o peso' : null,
               ),
               const SizedBox(height: 15),
-              // Foto (URI ou URL)
-              TextFormField(
-                controller: _fotoController,
-                decoration: const InputDecoration(
-                  labelText: 'Foto (URI ou URL)',
-                  border: OutlineInputBorder(),
-                ),
+              // Botões de Foto
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () async {
+                        final ImageService imageService = ImageService();
+                        final foto = await imageService.capturarFoto();
+                        if (foto != null) {
+                          setState(() => _fotoController.text = foto);
+                        }
+                      },
+                      icon: const Icon(Icons.camera_alt),
+                      label: const Text('Câmera'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () async {
+                        final ImageService imageService = ImageService();
+                        final foto = await imageService.selecionarDaGaleria();
+                        if (foto != null) {
+                          setState(() => _fotoController.text = foto);
+                        }
+                      },
+                      icon: const Icon(Icons.photo_library),
+                      label: const Text('Galeria'),
+                    ),
+                  ),
+                ],
               ),
+              if (_fotoController.text.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Text('Foto: ${_fotoController.text.split('/').last}', 
+                     style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
               const SizedBox(height: 15),
 
               // Proprietário / Propriedade / Lote (edição)
@@ -545,7 +828,7 @@ class _CadastrarGadoPageState extends State<CadastrarGadoPage> {
                   Expanded(
                     child: DropdownButtonFormField<String>(
                       decoration: const InputDecoration(labelText: 'Proprietário', border: OutlineInputBorder()),
-                      value: _ownerId,
+                      initialValue: _ownerId,
                       items: proprietarios
                           .map((p) => DropdownMenuItem(value: p.id, child: Text(p.nome)))
                           .toList(),
@@ -581,7 +864,7 @@ class _CadastrarGadoPageState extends State<CadastrarGadoPage> {
                   Expanded(
                     child: DropdownButtonFormField<String>(
                       decoration: const InputDecoration(labelText: 'Propriedade', border: OutlineInputBorder()),
-                      value: _propriedadeId,
+                      initialValue: _propriedadeId,
                       items: _ownerId == null
                           ? []
                           : proprietarios
@@ -623,7 +906,7 @@ class _CadastrarGadoPageState extends State<CadastrarGadoPage> {
                   Expanded(
                     child: DropdownButtonFormField<String>(
                       decoration: const InputDecoration(labelText: 'Lote', border: OutlineInputBorder()),
-                      value: _loteId,
+                      initialValue: _loteId,
                       items: (_ownerId == null || _propriedadeId == null)
                           ? []
                           : proprietarios
@@ -683,7 +966,7 @@ class _CadastrarGadoPageState extends State<CadastrarGadoPage> {
                   labelText: 'Sexo',
                   border: OutlineInputBorder(),
                 ),
-                value: _sexoSelecionado,
+                initialValue: _sexoSelecionado,
                 items: const [
                   DropdownMenuItem(value: 'Macho', child: Text('Macho')),
                   DropdownMenuItem(value: 'Fêmea', child: Text('Fêmea')),
@@ -865,6 +1148,7 @@ class _ListaGadoPageState extends State<ListaGadoPage> {
     // Filtra a lista com base na query
     final query = _searchQuery.toLowerCase();
     final filtered = gadosCadastrados.where((gado) {
+      if (gado.ativo == 0) return false; // oculta gado inativo
       if (query.isEmpty) return true;
       final ownerName = gado.ownerId == null
           ? ''
@@ -886,12 +1170,12 @@ class _ListaGadoPageState extends State<ListaGadoPage> {
               .firstWhere((l) => l.id == gado.loteId, orElse: () => Lote(id: '', nome: '') )
               .nome);
 
-      final combined = '${gado.nome} ${gado.id} ${gado.sexo} ${gado.vacinas} ${ownerName} ${propriedadeName} ${loteName}'.toLowerCase();
+      final combined = '${gado.nome} ${gado.id} ${gado.sexo} ${gado.vacinas} $ownerName $propriedadeName $loteName'.toLowerCase();
       return combined.contains(query);
     }).toList();
 
     return Scaffold(
-      appBar: AppBar(title: Text('Gado Cadastrado (${gadosCadastrados.length})')),
+      appBar: AppBar(title: Text('Gado Cadastrado (${gadosCadastrados.where((g) => g.ativo == 1).length})')),
       body: Column(
         children: [
           Padding(
@@ -976,8 +1260,8 @@ class _EditarGadoPageState extends State<EditarGadoPage> {
   void initState() {
     super.initState();
     _nomeController = TextEditingController(text: widget.gado.nome);
-    _idadeController = TextEditingController(text: widget.gado.idade);
-    _pesoController = TextEditingController(text: widget.gado.peso);
+    _idadeController = TextEditingController(text: widget.gado.idade.toString());
+    _pesoController = TextEditingController(text: widget.gado.peso.toString());
     _fotoController = TextEditingController(text: widget.gado.foto ?? '');
     _sexoSelecionado = widget.gado.sexo == 'Não informado' ? null : widget.gado.sexo;
     
@@ -1022,55 +1306,69 @@ class _EditarGadoPageState extends State<EditarGadoPage> {
   
 
 
-  void _salvarEdicao() {
+  Future<void> _salvarEdicao() async {
     if (_formKey.currentState!.validate()) {
-      // 1. Atualiza o objeto Gado original
-      final oldOwnerId = widget.gado.ownerId;
-      final oldPropId = widget.gado.propriedadeId;
+      try {
+        // 1. Atualiza o objeto Gado original
+        final oldOwnerId = widget.gado.ownerId;
+        final oldPropId = widget.gado.propriedadeId;
 
-      widget.gado.nome = _nomeController.text;
-      widget.gado.idade = _idadeController.text;
-      widget.gado.peso = _pesoController.text;
-      // NOVO: Atualiza a string de vacinas
-      widget.gado.vacinas = _vacinasSelecionadas.isEmpty
-          ? 'N/A'
-          : _vacinasSelecionadas.join(', ');
-      widget.gado.sexo = _sexoSelecionado ?? 'Não informado';
-      widget.gado.foto = _fotoController.text.isEmpty ? null : _fotoController.text;
-      widget.gado.ownerId = _ownerId;
-      widget.gado.propriedadeId = _propriedadeId;
-      widget.gado.loteId = _loteId;
+        widget.gado.nome = _nomeController.text;
+        widget.gado.idade = int.tryParse(_idadeController.text) ?? widget.gado.idade;
+        widget.gado.peso = int.tryParse(_pesoController.text) ?? widget.gado.peso;
+        // NOVO: Atualiza a string de vacinas
+        widget.gado.vacinas = _vacinasSelecionadas.isEmpty
+            ? 'N/A'
+            : _vacinasSelecionadas.join(', ');
+        widget.gado.sexo = _sexoSelecionado ?? 'Não informado';
+        widget.gado.foto = _fotoController.text.isEmpty ? null : _fotoController.text;
+        widget.gado.ownerId = _ownerId;
+        widget.gado.propriedadeId = _propriedadeId;
+        widget.gado.loteId = _loteId;
 
-      // Atualiza referências em propriedades: remove de antiga propriedade e adiciona na nova
-      if (oldPropId != null) {
-        final oi = proprietarios.indexWhere((p) => p.id == oldOwnerId);
-        if (oi != -1) {
-          final pi = proprietarios[oi].propriedades.indexWhere((pr) => pr.id == oldPropId);
-          if (pi != -1) {
-            proprietarios[oi].propriedades[pi].gadoIds.removeWhere((id) => id == widget.gado.id);
+        // Atualizar no banco de dados
+        await DatabaseHelper().atualizarGado(widget.gado.id, widget.gado.toMap());
+
+        // Atualiza referências em propriedades: remove de antiga propriedade e adiciona na nova
+        if (oldPropId != null) {
+          final oi = proprietarios.indexWhere((p) => p.id == oldOwnerId);
+          if (oi != -1) {
+            final pi = proprietarios[oi].propriedades.indexWhere((pr) => pr.id == oldPropId);
+            if (pi != -1) {
+              proprietarios[oi].propriedades[pi].gadoIds.removeWhere((id) => id == widget.gado.id);
+            }
           }
         }
-      }
-      if (_propriedadeId != null && _ownerId != null) {
-        final oi2 = proprietarios.indexWhere((p) => p.id == _ownerId);
-        if (oi2 != -1) {
-          final pi2 = proprietarios[oi2].propriedades.indexWhere((pr) => pr.id == _propriedadeId);
-          if (pi2 != -1) {
-            final exists = proprietarios[oi2].propriedades[pi2].gadoIds.contains(widget.gado.id);
-            if (!exists) proprietarios[oi2].propriedades[pi2].gadoIds.add(widget.gado.id);
+        if (_propriedadeId != null && _ownerId != null) {
+          final oi2 = proprietarios.indexWhere((p) => p.id == _ownerId);
+          if (oi2 != -1) {
+            final pi2 = proprietarios[oi2].propriedades.indexWhere((pr) => pr.id == _propriedadeId);
+            if (pi2 != -1) {
+              final exists = proprietarios[oi2].propriedades[pi2].gadoIds.contains(widget.gado.id);
+              if (!exists) proprietarios[oi2].propriedades[pi2].gadoIds.add(widget.gado.id);
+            }
           }
         }
+
+        // 2. Chama o callback para notificar a tela de detalhes
+        widget.onGadoEdited();
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${widget.gado.nome} atualizado com sucesso!')),
+        );
+
+        // Volta para a tela de detalhes
+        Navigator.pop(context);
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Erro ao atualizar: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
       }
-
-      // 2. Chama o callback para notificar a tela de detalhes
-      widget.onGadoEdited();
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${widget.gado.nome} atualizado com sucesso!')),
-      );
-
-      // Volta para a tela de detalhes
-      Navigator.pop(context);
     }
   }
 
@@ -1117,6 +1415,45 @@ class _EditarGadoPageState extends State<EditarGadoPage> {
               ),
               const SizedBox(height: 15),
               
+              // Botões de Foto
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () async {
+                        final ImageService imageService = ImageService();
+                        final foto = await imageService.capturarFoto();
+                        if (foto != null) {
+                          setState(() => _fotoController.text = foto);
+                        }
+                      },
+                      icon: const Icon(Icons.camera_alt),
+                      label: const Text('Câmera'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () async {
+                        final ImageService imageService = ImageService();
+                        final foto = await imageService.selecionarDaGaleria();
+                        if (foto != null) {
+                          setState(() => _fotoController.text = foto);
+                        }
+                      },
+                      icon: const Icon(Icons.photo_library),
+                      label: const Text('Galeria'),
+                    ),
+                  ),
+                ],
+              ),
+              if (_fotoController.text.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Text('Foto: ${_fotoController.text.split('/').last}', 
+                     style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
+              const SizedBox(height: 15),
+              
               // NOVO CAMPO: Seleção Múltipla de Vacinas
               TextFormField(
                 decoration: InputDecoration(
@@ -1139,7 +1476,7 @@ class _EditarGadoPageState extends State<EditarGadoPage> {
                   labelText: 'Sexo',
                   border: OutlineInputBorder(),
                 ),
-                value: _sexoSelecionado,
+                initialValue: _sexoSelecionado,
                 items: const [
                   DropdownMenuItem(value: 'Macho', child: Text('Macho')),
                   DropdownMenuItem(value: 'Fêmea', child: Text('Fêmea')),
@@ -1192,6 +1529,92 @@ class _DetalheGadoPageState extends State<DetalheGadoPage> {
     });
     // Notifica a lista principal
     widget.onGadoChanged();
+  }
+
+  Future<void> _registrarSaidaDialog() async {
+    final tipoOptions = ['venda', 'perda'];
+    String? tipoSelecionado = 'venda';
+    final TextEditingController obsCtrl = TextEditingController();
+    DateTime dataSelecionada = DateTime.now();
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Registrar Saída'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+                DropdownButtonFormField<String>(
+              decoration: const InputDecoration(labelText: 'Tipo', border: OutlineInputBorder()),
+              initialValue: tipoSelecionado,
+              onChanged: (v) => tipoSelecionado = v,
+              items: tipoOptions.map((t) => DropdownMenuItem(value: t, child: Text(t.toUpperCase()))).toList(),
+            ),
+            const SizedBox(height: 10),
+            TextFormField(
+              controller: obsCtrl,
+              decoration: const InputDecoration(labelText: 'Observações (opcional)', border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(child: Text('Data: ${dataSelecionada.toLocal().toString().split(' ').first}')),
+                TextButton(
+                  onPressed: () async {
+                    final picked = await showDatePicker(
+                      context: context,
+                      initialDate: dataSelecionada,
+                      firstDate: DateTime(2000),
+                      lastDate: DateTime(2100),
+                    );
+                    if (picked != null) {
+                      setState(() {
+                        dataSelecionada = picked;
+                      });
+                    }
+                  },
+                  child: const Text('Alterar'),
+                )
+              ],
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Registrar')),
+        ],
+      ),
+    );
+
+        if (ok == true && tipoSelecionado != null) {
+      try {
+        await DatabaseHelper().registrarSaida(
+          gadoId: widget.gado.id,
+          tipo: tipoSelecionado!,
+          data: dataSelecionada,
+              observacoes: obsCtrl.text.trim().isEmpty ? null : obsCtrl.text.trim(),
+        );
+
+        // Atualiza estado local
+        setState(() {
+          widget.gado.ativo = 0;
+        });
+        // Remove da lista em memória
+        gadosCadastrados.removeWhere((g) => g.id == widget.gado.id);
+        widget.onGadoChanged();
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Saída registrada (${tipoSelecionado!.toUpperCase()})')),
+        );
+        Navigator.pop(context); // Volta para a lista
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erro ao registrar saída: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
   }
 
   void _goToEdit(BuildContext context) {
@@ -1382,6 +1805,18 @@ class _DetalheGadoPageState extends State<DetalheGadoPage> {
                         label: const Text('Editar', style: TextStyle(color: Colors.white)),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.blue,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _registrarSaidaDialog,
+                        icon: const Icon(Icons.logout, color: Colors.white),
+                        label: const Text('Registrar Saída', style: TextStyle(color: Colors.white)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
                           padding: const EdgeInsets.symmetric(vertical: 12),
                         ),
                       ),
